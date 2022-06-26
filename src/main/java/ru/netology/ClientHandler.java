@@ -1,16 +1,18 @@
 package ru.netology;
 
-import java.io.BufferedOutputStream;
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
+import org.apache.http.client.utils.URLEncodedUtils;
+
+import java.io.*;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
 import java.net.Socket;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 
 public class ClientHandler implements Runnable {
 
@@ -25,14 +27,13 @@ public class ClientHandler implements Runnable {
 
     @Override
     public void run() {
-        try (final var in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+        try (final var in = new BufferedInputStream(socket.getInputStream());
              final var out = new BufferedOutputStream(socket.getOutputStream())) {
             while (true) {
 
                 Request request = createRequest(in, out);
 
                 Handler handler = Server.getHandlers().get(request.getMethod()).get(request.getPath());
-                System.out.println(handler);
 
                 if (handler == null) {
                     Path parent = Path.of(request.getPath()).getParent();
@@ -47,40 +48,116 @@ public class ClientHandler implements Runnable {
                 responseOK(request, out);
             }
 
-        } catch (IOException e) {
+        } catch (IOException | URISyntaxException e) {
+            e.printStackTrace();
         }
     }
 
-    private Request createRequest(BufferedReader in, BufferedOutputStream out) throws IOException {
+    private Request createRequest(BufferedInputStream in, BufferedOutputStream out) throws IOException, URISyntaxException {
+        // лимит на request line + заголовки
+        final int limit = 4096;
+
+        in.mark(limit);
+        final byte[] buffer = new byte[limit];
+
+        final int read = in.read(buffer);
+        // ищем request line
+
+        final byte[] requestLineDelimiter = new byte[]{'\r', '\n'};
+        final int requestLineEnd = indexOf(buffer, requestLineDelimiter, 0, read);
+        if (requestLineEnd == -1) {
+            error404NotFound(out);
+            return null;
+        }
         // read only request line for simplicity
         // must be in form GET /path HTTP/1.1
-        final var requestLine = in.readLine();
-        final var parts = requestLine.split(" ");
+        final String[] requestLine = new String(Arrays.copyOf(buffer, requestLineEnd)).split(" ");
 
-        if (parts.length != 3) {
-            // just close socket
-            socket.close();
-        }
-
-        final var path = parts[1];
-
-        if (!validPaths.contains(path)) {
+        // читаем request line
+        if (requestLine.length != 3) {
             error404NotFound(out);
+            return null;
         }
 
-        String line;
-        Map<String, String> headers = new HashMap<>();
-        while (!(line = in.readLine()).equals("")) {
-            var indexOf = line.indexOf(":");
-            var name = line.substring(0, indexOf);
-            var value = line.substring(indexOf + 2);
-            headers.put(name, value);
+        final String method = requestLine[0];
+
+        final String path = requestLine[1];
+        if (!requestLine[1].startsWith("/")) {
+            error404NotFound(out);
+            return null;
         }
 
-        Request request = new Request(parts[0], parts[1], headers, socket.getInputStream());
+        //ищем заголовки
+        final byte[] headersDelimiter = new byte[]{'\r', '\n', '\r', '\n'};
+        final int headersStart = requestLineEnd + requestLineDelimiter.length;
+        final int headersEnd = indexOf(buffer, headersDelimiter, headersStart, read);
+        if (headersEnd == -1) {
+            error404NotFound(out);
+            return null;
+        }
+
+        // отматываем на начало буфера
+        in.reset();
+        // пропускаем requestLine
+        in.skip(headersStart);
+
+        final byte[] headersBytes = in.readNBytes(headersEnd - headersStart);
+        final List<String> headers = Arrays.asList(new String(headersBytes).split("\r\n"));
+
+
+        //для GET тела нет
+        String body = null;
+        if (!method.equals("GET")) {
+            in.skip(headersDelimiter.length);
+            // вычитываем Content-Length, чтобы прочитать body
+            final Optional<String> contentLength = extractHeader(headers, "Content-Length");
+            if (contentLength.isPresent()) {
+                final int length = Integer.parseInt(contentLength.get());
+                final byte[] bodyBytes = in.readNBytes(length);
+                body = new String(bodyBytes);
+            }
+            // вычитываем Content-Type, чтобы понять есть ли в body параметры
+            final Optional<String> contentType = extractHeader(headers, "Content-Length");
+            if (contentType.isPresent()) {
+                final String type = contentType.get();
+                if (type.equals("application/x-www-form-urlencoded")) {
+                    // request.setPostParams(URLEncodedUtils.parse(request.getBody(), StandardCharsets.UTF_8));
+                }
+            }
+        }
+
+        Request request = new Request(method, path, headers, body);
+        final URI uri = new URI(path);
+
+        request.setQueryParams(URLEncodedUtils.parse(uri, StandardCharsets.UTF_8));
+
         System.out.println(request);
+        System.out.println(request.getQueryParam("value"));
         out.flush();
+
         return request;
+    }
+
+    // from google guava with modifications
+    private int indexOf(byte[] array, byte[] target, int start, int max) {
+        outer:
+        for (int i = start; i < max - target.length + 1; i++) {
+            for (int j = 0; j < target.length; j++) {
+                if (array[i + j] != target[j]) {
+                    continue outer;
+                }
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    private static Optional<String> extractHeader(List<String> headers, String header) {
+        return headers.stream()
+                .filter(o -> o.startsWith(header))
+                .map(o -> o.substring(o.indexOf(" ")))
+                .map(String::trim)
+                .findFirst();
     }
 
 
@@ -91,7 +168,6 @@ public class ClientHandler implements Runnable {
                         "Connection: close\r\n" +
                         "\r\n"
         ).getBytes());
-        responseStream.flush();
     }
 
 
@@ -101,20 +177,21 @@ public class ClientHandler implements Runnable {
         final var mimeType = Files.probeContentType(filePath);
 
         // special case for classic
-
-        final var template = Files.readString(filePath);
-        final var content = template.replace(
-                "{time}",
-                LocalDateTime.now().toString()
-        ).getBytes();
-        responseStream.write((
-                "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: " + mimeType + "\r\n" +
-                        "Content-Length: " + content.length + "\r\n" +
-                        "Connection: close\r\n" +
-                        "\r\n"
-        ).getBytes());
-        responseStream.write(content);
+        if (request.getPath().equals("/classic.html")) {
+            final var template = Files.readString(filePath);
+            final var content = template.replace(
+                    "{time}",
+                    LocalDateTime.now().toString()
+            ).getBytes();
+            responseStream.write((
+                    "HTTP/1.1 200 OK\r\n" +
+                            "Content-Type: " + mimeType + "\r\n" +
+                            "Content-Length: " + content.length + "\r\n" +
+                            "Connection: close\r\n" +
+                            "\r\n"
+            ).getBytes());
+            responseStream.write(content);
+        }
 
         final var length = Files.size(filePath);
         responseStream.write((
@@ -125,7 +202,6 @@ public class ClientHandler implements Runnable {
                         "\r\n"
         ).getBytes());
         Files.copy(filePath, responseStream);
-        responseStream.flush();
     }
 
 }
